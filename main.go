@@ -42,26 +42,16 @@ func generateRandomSlug(length int) string {
 	return string(b)
 }
 
-func main() {
-	if err := godotenv.Load(); err != nil {
-		log.Fatal("Error loading .env file")
-	}
-
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-		os.Getenv("DB_USER"),
-		os.Getenv("DB_PASSWORD"),
-		os.Getenv("DB_HOST"),
-		os.Getenv("DB_PORT"),
-		os.Getenv("DB_NAME"))
-
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
-	}
-
-	db.AutoMigrate(&URL{})
-
+func setupRouter(db *gorm.DB) *gin.Engine {
 	router := gin.Default()
+
+	// Add ping endpoint for health check
+	router.GET("/ping", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"message": "pong",
+			"status":  "Database connected successfully",
+		})
+	})
 
 	// Generate short URL
 	router.POST("/generate/shortlink", func(c *gin.Context) {
@@ -71,14 +61,12 @@ func main() {
 			return
 		}
 
-		// Validate URL
 		if !strings.HasPrefix(request.URL, "http://") && !strings.HasPrefix(request.URL, "https://") {
 			c.JSON(400, gin.H{"error": "URL must start with http:// or https://"})
 			return
 		}
 
-		// Set expiration date
-		expirationDate := time.Now().Add(24 * time.Hour) // Default 24 hours
+		expirationDate := time.Now().Add(24 * time.Hour)
 		if request.ExpirationDate != "" {
 			parsedDate, err := time.Parse("2006-01-02", request.ExpirationDate)
 			if err == nil {
@@ -88,7 +76,6 @@ func main() {
 
 		var shortLink string
 		if request.CustomSlug != "" {
-			// Check if custom slug exists
 			var existingURL URL
 			if result := db.Where("short_link = ?", request.CustomSlug).First(&existingURL); result.Error == nil {
 				c.JSON(409, gin.H{"error": "Custom slug already exists"})
@@ -96,7 +83,6 @@ func main() {
 			}
 			shortLink = request.CustomSlug
 		} else {
-			// Generate random slug
 			shortLink = generateRandomSlug(6)
 			for {
 				var existingURL URL
@@ -126,7 +112,6 @@ func main() {
 		})
 	})
 
-	// Redirect to original URL
 	router.GET("/:shortLink", func(c *gin.Context) {
 		shortLink := c.Param("shortLink")
 		var url URL
@@ -145,7 +130,6 @@ func main() {
 		c.Redirect(302, url.OriginalURL)
 	})
 
-	// Delete URL
 	router.DELETE("/:shortLink", func(c *gin.Context) {
 		shortLink := c.Param("shortLink")
 		var url URL
@@ -159,5 +143,50 @@ func main() {
 		c.JSON(200, gin.H{"message": "URL deleted successfully"})
 	})
 
-	router.Run(":8080")
+	return router
+}
+
+func setupDatabase() (*gorm.DB, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_PORT"),
+		os.Getenv("DB_NAME"))
+
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		return nil, err
+	}
+
+	err = db.AutoMigrate(&URL{})
+	if err != nil {
+		return nil, err
+	}
+
+	return db, nil
+}
+
+func main() {
+	// Initialize random seed
+	rand.Seed(time.Now().UnixNano())
+
+	// Load environment variables
+	if err := godotenv.Load(); err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
+	// Setup database
+	db, err := setupDatabase()
+	if err != nil {
+		log.Fatal("Database setup failed:", err)
+	}
+
+	// Setup router
+	router := setupRouter(db)
+
+	// Start server
+	if err := router.Run(":8080"); err != nil {
+		log.Fatal("Failed to start server:", err)
+	}
 }
