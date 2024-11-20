@@ -30,7 +30,7 @@ A high-performance URL shortening service built with Go, Gin, and MySQL.
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/url-shortener.git
+git clone ssh://git@github.com:MunishMummadi/url-shortener.git
 cd url-shortener
 ```
 
