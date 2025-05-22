@@ -1,36 +1,37 @@
-// config/database.go
 package config
 
 import (
 	"fmt"
-	"log"
 	"os"
+	"url-shortener/logging"
 	"url-shortener/models"
 
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
-func SetupDatabase() *gorm.DB {
-	dbUser := os.Getenv("DB_USER")
-	dbPassword := os.Getenv("DB_PASSWORD")
-	dbName := os.Getenv("DB_NAME")
-	dbHost := os.Getenv("DB_HOST")
-	dbPort := os.Getenv("DB_PORT")
-
+// SetupDatabase initializes and returns a database connection
+func SetupDatabase() (*gorm.DB, error) {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-		dbUser, dbPassword, dbHost, dbPort, dbName)
+		os.Getenv("DB_USER"),
+		os.Getenv("DB_PASSWORD"),
+		os.Getenv("DB_HOST"),
+		os.Getenv("DB_PORT"),
+		os.Getenv("DB_NAME"),
+	)
 
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
+		logging.Log.WithError(err).Error("Failed to connect to database")
+		return nil, err
 	}
 
-	// Auto migrate the schema
+	// Use models.URL for AutoMigrate
 	err = db.AutoMigrate(&models.URL{})
 	if err != nil {
-		log.Fatal("Failed to migrate database:", err)
+		logging.Log.WithError(err).Error("Failed to migrate database")
+		return nil, err
 	}
-
-	return db
+	logging.Log.Info("Database migration completed successfully")
+	return db, nil
 }
