@@ -1,141 +1,188 @@
-// controllers/url_controller.go
 package controllers
 
 import (
 	"net/http"
+	"strings"
 	"time"
 	"url-shortener/dto/request"
 	"url-shortener/dto/response"
-	"url-shortener/services"
+	"url-shortener/logging" // Added for logrus
+	"url-shortener/models"
+	"url-shortener/utils"
 
 	"github.com/gin-gonic/gin"
+	"github.com/sirupsen/logrus" // Added for logrus fields
+	"gorm.io/gorm"
 )
 
+// Helper function for standardized error responses
+func errorResponse(c *gin.Context, statusCode int, message string) {
+	logging.Log.WithFields(logrus.Fields{
+		"status_code": statusCode,
+		"path":        c.Request.URL.Path,
+		"method":      c.Request.Method,
+	}).Error(message)
+	c.JSON(statusCode, gin.H{"error": message})
+}
+
+// Helper function for internal server errors (logs actual error, returns generic message)
+func internalServerErrorResponse(c *gin.Context, err error, message string) {
+	logging.Log.WithError(err).WithFields(logrus.Fields{
+		"path":   c.Request.URL.Path,
+		"method": c.Request.Method,
+	}).Error(message) // Log the detailed error internally
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "An internal server error occurred"}) // Generic message to client
+}
+
 type URLController struct {
-	urlService services.URLService
+	db *gorm.DB
 }
 
-func NewURLController(urlService services.URLService) *URLController {
-	return &URLController{urlService: urlService}
+func NewURLController(db *gorm.DB) *URLController {
+	return &URLController{db: db}
 }
 
-func (c *URLController) GenerateShortLink(ctx *gin.Context) {
+func (controller *URLController) CreateShortURL(c *gin.Context) {
 	var req request.CreateURLRequest
-	if err := ctx.ShouldBindJSON(&req); err != nil {
-		ctx.JSON(http.StatusBadRequest, response.ErrorResponse{
-			Status: "400",
-			Error:  err.Error(),
-		})
+	if err := c.ShouldBindJSON(&req); err != nil {
+		errorResponse(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Parse expiration date or set default (24 hours from now)
-	expirationDate := time.Now().Add(24 * time.Hour)
+	if !strings.HasPrefix(req.URL, "http://") && !strings.HasPrefix(req.URL, "https://") {
+		errorResponse(c, http.StatusBadRequest, "URL must start with http:// or https://")
+		return
+	}
+
+	expirationDate := time.Now().Add(24 * time.Hour) // Default expiration: 24 hours
 	if req.ExpirationDate != "" {
 		parsedDate, err := time.Parse("2006-01-02", req.ExpirationDate)
 		if err != nil {
-			ctx.JSON(http.StatusBadRequest, response.ErrorResponse{
-				Status: "400",
-				Error:  "Invalid expiration date format",
-			})
+			errorResponse(c, http.StatusBadRequest, "Invalid expiration date format. Use YYYY-MM-DD")
 			return
 		}
 		expirationDate = parsedDate
 	}
 
-	url, err := c.urlService.CreateURL(req.URL, req.CustomSlug, expirationDate)
-	if err != nil {
-		ctx.JSON(http.StatusConflict, response.ErrorResponse{
-			Status: "409",
-			Error:  err.Error(),
-		})
+	var shortLink string
+	if req.CustomSlug != "" {
+		var existingURL models.URL
+		// Check if custom slug already exists
+		if result := controller.db.Where("short_link = ?", req.CustomSlug).First(&existingURL); result.Error == nil {
+			errorResponse(c, http.StatusConflict, "Custom slug already exists")
+			return
+		} else if result.Error != gorm.ErrRecordNotFound {
+			internalServerErrorResponse(c, result.Error, "Database error checking custom slug")
+			return
+		}
+		shortLink = req.CustomSlug
+	} else {
+		// Generate a unique random slug
+		for {
+			shortLink = utils.GenerateRandomSlug(6)
+			var existingURL models.URL
+			if result := controller.db.Where("short_link = ?", shortLink).First(&existingURL); result.Error != nil {
+				if result.Error == gorm.ErrRecordNotFound {
+					// If error (record not found), slug is unique
+					break
+				}
+				internalServerErrorResponse(c, result.Error, "Database error generating unique slug")
+				return
+			}
+		}
+	}
+
+	url := models.URL{
+		OriginalURL:    req.URL,
+		ShortLink:      shortLink,
+		ExpirationDate: expirationDate,
+	}
+
+	result := controller.db.Create(&url)
+	if result.Error != nil {
+		internalServerErrorResponse(c, result.Error, "Failed to create short URL")
 		return
 	}
 
-	ctx.JSON(http.StatusCreated, response.URLResponse{
+	c.JSON(http.StatusCreated, response.URLResponse{
 		OriginalURL:    url.OriginalURL,
 		ShortLink:      url.ShortLink,
 		ExpirationDate: url.ExpirationDate,
 	})
 }
 
-func (c *URLController) ValidateCustomSlug(ctx *gin.Context) {
-	var req request.ValidateSlugRequest
-	if err := ctx.ShouldBindJSON(&req); err != nil {
-		ctx.JSON(http.StatusBadRequest, response.ErrorResponse{
-			Status: "400",
-			Error:  err.Error(),
-		})
+func (controller *URLController) RedirectToURL(c *gin.Context) {
+	shortLink := c.Param("shortLink")
+	var url models.URL
+
+	if result := controller.db.Where("short_link = ?", shortLink).First(&url); result.Error != nil {
+		if result.Error == gorm.ErrRecordNotFound {
+			errorResponse(c, http.StatusNotFound, "Short URL not found")
+		} else {
+			internalServerErrorResponse(c, result.Error, "Database error fetching URL for redirect")
+		}
 		return
 	}
 
-	exists := c.urlService.IsCustomSlugExists(req.CustomSlug)
-	if exists {
-		ctx.JSON(http.StatusConflict, response.MessageResponse{
-			Message: "Custom slug already exists",
-		})
+	// Check if the URL has expired
+	if time.Now().After(url.ExpirationDate) {
+		if delResult := controller.db.Delete(&url); delResult.Error != nil {
+			internalServerErrorResponse(c, delResult.Error, "Failed to delete expired URL")
+			// Even if deletion fails, the URL is still expired from client's perspective
+			// So, we still return StatusGone.
+			// Alternatively, one might choose to not delete and let a background job handle it.
+		}
+		errorResponse(c, http.StatusGone, "URL has expired")
 		return
 	}
 
-	ctx.JSON(http.StatusOK, response.MessageResponse{
-		Message: "Custom slug is available",
-	})
+	c.Redirect(http.StatusFound, url.OriginalURL)
 }
 
-func (c *URLController) RedirectToOriginalURL(ctx *gin.Context) {
-	shortLink := ctx.Param("shortLink")
-	url, err := c.urlService.GetURL(shortLink)
-	if err != nil {
-		ctx.JSON(http.StatusNotFound, response.ErrorResponse{
-			Status: "404",
-			Error:  "URL does not exist or it might have expired",
-		})
+func (controller *URLController) DeleteShortURL(c *gin.Context) {
+	shortLink := c.Param("shortLink")
+	var url models.URL
+
+	// Find the URL by shortLink
+	if result := controller.db.Where("short_link = ?", shortLink).First(&url); result.Error != nil {
+		if result.Error == gorm.ErrRecordNotFound {
+			errorResponse(c, http.StatusNotFound, "Short URL not found")
+		} else {
+			internalServerErrorResponse(c, result.Error, "Database error fetching URL for deletion")
+		}
 		return
 	}
 
-	ctx.Redirect(http.StatusFound, url.OriginalURL)
+	// Delete the URL
+	if result := controller.db.Delete(&url); result.Error != nil {
+		internalServerErrorResponse(c, result.Error, "Failed to delete URL")
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "URL deleted successfully"})
 }
 
-func (c *URLController) DeleteShortURL(ctx *gin.Context) {
-	shortLink := ctx.Param("shortLink")
-	err := c.urlService.DeleteURL(shortLink)
+func (controller *URLController) Ping(c *gin.Context) {
+	sqlDB, err := controller.db.DB() // controller is the URLController instance
 	if err != nil {
-		ctx.JSON(http.StatusNotFound, response.ErrorResponse{
-			Status: "404",
-			Error:  "URL does not exist or it might have expired",
-		})
+		// Log the error internally
+		logging.Log.WithError(err).Error("Failed to get underlying DB object for health check")
+		// Use the standardized error response
+		internalServerErrorResponse(c, err, "Error accessing database for health check") // Use internalServerErrorResponse for 500
 		return
 	}
 
-	ctx.JSON(http.StatusOK, response.MessageResponse{
-		Message: "Short URL has been successfully deleted",
-	})
-}
-
-func (c *URLController) SetExpirationDate(ctx *gin.Context) {
-	shortCode := ctx.Param("shortCode")
-	var req request.UpdateExpirationRequest
-	if err := ctx.ShouldBindJSON(&req); err != nil {
-		ctx.JSON(http.StatusBadRequest, response.ErrorResponse{
-			Status: "400",
-			Error:  err.Error(),
-		})
-		return
-	}
-
-	expirationDate, _ := time.Parse("2006-01-02", req.ExpirationDate)
-	url, err := c.urlService.SetExpirationDate(shortCode, expirationDate)
+	err = sqlDB.Ping()
 	if err != nil {
-		ctx.JSON(http.StatusNotFound, response.ErrorResponse{
-			Status: "404",
-			Error:  "URL does not exist or it might have expired",
-		})
+		// Log the error internally
+		logging.Log.WithError(err).Warn("Database ping failed during health check")
+		// Use the standardized error response, but with 503
+		errorResponse(c, http.StatusServiceUnavailable, "Database not reachable")
 		return
 	}
 
-	ctx.JSON(http.StatusOK, response.URLResponse{
-		OriginalURL:    url.OriginalURL,
-		ShortLink:      url.ShortLink,
-		ExpirationDate: url.ExpirationDate,
+	c.JSON(http.StatusOK, gin.H{
+		"message": "pong",
+		"status":  "Database connected successfully", // This message remains the same on success
 	})
 }

@@ -160,3 +160,27 @@ func TestDeleteURL(t *testing.T) {
 
 	assert.Equal(t, 404, w.Code)
 }
+
+func TestPingEndpoint(t *testing.T) {
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/ping", nil)
+	testRouter.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var response map[string]string
+	err := json.Unmarshal(w.Body.Bytes(), &response)
+	assert.NoError(t, err)
+
+	expectedResponse := map[string]string{
+		"message": "pong",
+		"status":  "Database connected successfully",
+	}
+	assert.Equal(t, expectedResponse, response)
+
+	// Assert security headers
+	assert.Equal(t, "nosniff", w.Header().Get("X-Content-Type-Options"))
+	assert.Equal(t, "DENY", w.Header().Get("X-Frame-Options"))
+	assert.Equal(t, "default-src 'self'; script-src 'self'; object-src 'none';", w.Header().Get("Content-Security-Policy"))
+	assert.Equal(t, "1; mode=block", w.Header().Get("X-XSS-Protection"))
+}
